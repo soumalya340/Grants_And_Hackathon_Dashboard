@@ -52,6 +52,17 @@ const storageKey = 'orbit-opportunities-v1'
 const kinds: Kind[] = ['grant', 'hackathon', 'bounty']
 const statuses: Status[] = ['saved', 'in progress', 'submitted', 'won']
 
+async function cloudRequest<T>(key: string, method = 'GET', item?: Opportunity, id?: string): Promise<T> {
+  const response = await fetch(`/api/opportunities${id ? `?id=${encodeURIComponent(id)}` : ''}`, {
+    method,
+    headers: { Authorization: `Bearer ${key}`, ...(item ? { 'Content-Type': 'application/json' } : {}) },
+    body: item ? JSON.stringify(item) : undefined,
+  })
+  const data = await response.json()
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`)
+  return data as T
+}
+
 function dateAfter(days: number) {
   const date = new Date()
   date.setHours(12, 0, 0, 0)
@@ -126,6 +137,7 @@ function isUrgent(item: Opportunity) {
 
 function App() {
   const [opportunities, setOpportunities] = useState<Opportunity[]>(readOpportunities)
+  const [cloudKey, setCloudKey] = useState<string | null>(() => sessionStorage.getItem('orbit-api-key'))
   const [view, setView] = useState<View>('overview')
   const [kindFilter, setKindFilter] = useState<Kind | 'all'>('all')
   const [statusFilter, setStatusFilter] = useState<Status | 'all'>('all')
@@ -137,12 +149,29 @@ function App() {
   const [toast, setToast] = useState<Toast | null>(null)
 
   useEffect(() => {
+    if (cloudKey) return
     try {
       localStorage.setItem(storageKey, JSON.stringify(opportunities))
     } catch {
       setToast({ message: 'Couldn’t save to this browser. Export a copy to keep your changes.' })
     }
-  }, [opportunities])
+  }, [opportunities, cloudKey])
+
+  useEffect(() => {
+    if (!cloudKey) return
+    let cancelled = false
+    const load = (reportError = false) => {
+      cloudRequest<Opportunity[]>(cloudKey).then(items => {
+        if (!cancelled) setOpportunities(items)
+      }).catch(error => {
+        if (!cancelled && reportError) setToast({ message: `Couldn’t load Neon data: ${error.message}` })
+      })
+    }
+    load(true)
+    const onFocus = () => load()
+    window.addEventListener('focus', onFocus)
+    return () => { cancelled = true; window.removeEventListener('focus', onFocus) }
+  }, [cloudKey])
 
   useEffect(() => {
     if (!menuOpen) return
@@ -191,32 +220,89 @@ function App() {
     setEditing(null)
   }
 
-  function saveOpportunity(value: Opportunity) {
-    setOpportunities(current => editing
-      ? current.map(item => item.id === editing.id ? value : item)
-      : [value, ...current])
-    setToast({ message: editing ? 'Changes saved' : `Added “${value.title}”` })
-    closeForm()
+  async function connectCloud() {
+    if (cloudKey) {
+      sessionStorage.removeItem('orbit-api-key')
+      setCloudKey(null)
+      setOpportunities(readOpportunities())
+      setToast({ message: 'Showing this browser’s saved opportunities.' })
+      return
+    }
+    const key = window.prompt('Enter your Orbit API key to connect to Neon:')?.trim()
+    if (!key) return
+    try {
+      const items = await cloudRequest<Opportunity[]>(key)
+      sessionStorage.setItem('orbit-api-key', key)
+      setCloudKey(key)
+      setOpportunities(items)
+      setToast({ message: 'Connected to Neon.' })
+    } catch (error) {
+      setToast({ message: `Couldn’t connect: ${(error as Error).message}` })
+    }
   }
 
-  function updateStatus(id: string, status: Status) {
-    setOpportunities(current => current.map(item => item.id === id ? { ...item, status, sample: false } : item))
+  async function refreshCloud() {
+    if (!cloudKey) return
+    try {
+      setOpportunities(await cloudRequest<Opportunity[]>(cloudKey))
+      setToast({ message: 'Neon data refreshed.' })
+    } catch (error) {
+      setToast({ message: `Couldn’t refresh: ${(error as Error).message}` })
+    }
   }
 
-  function restore(items: Opportunity[]) {
-    setOpportunities(current => [...items.filter(item => !current.some(entry => entry.id === item.id)), ...current])
-    setToast(null)
+  async function saveOpportunity(value: Opportunity) {
+    try {
+      const saved = cloudKey
+        ? await cloudRequest<Opportunity>(cloudKey, editing ? 'PUT' : 'POST', value, editing?.id)
+        : value
+      setOpportunities(current => editing
+        ? current.map(item => item.id === editing.id ? saved : item)
+        : [saved, ...current])
+      setToast({ message: editing ? 'Changes saved' : `Added “${value.title}”` })
+      closeForm()
+    } catch (error) {
+      setToast({ message: `Couldn’t save: ${(error as Error).message}` })
+    }
   }
 
-  function deleteOpportunity(item: Opportunity) {
-    setOpportunities(current => current.filter(entry => entry.id !== item.id))
-    setToast({ message: `Deleted “${item.title}”`, undo: () => restore([item]) })
+  async function updateStatus(id: string, status: Status) {
+    const item = opportunities.find(entry => entry.id === id)
+    if (!item) return
+    try {
+      const updated = cloudKey
+        ? await cloudRequest<Opportunity>(cloudKey, 'PUT', { ...item, status, sample: false }, id)
+        : { ...item, status, sample: false }
+      setOpportunities(current => current.map(entry => entry.id === id ? updated : entry))
+    } catch (error) {
+      setToast({ message: `Couldn’t update status: ${(error as Error).message}` })
+    }
+  }
+
+  async function restore(items: Opportunity[]) {
+    try {
+      const restored = cloudKey ? await Promise.all(items.map(item => cloudRequest<Opportunity>(cloudKey, 'POST', item))) : items
+      setOpportunities(current => [...restored.filter(item => !current.some(entry => entry.id === item.id)), ...current])
+      setToast(null)
+    } catch (error) {
+      setToast({ message: `Couldn’t restore: ${(error as Error).message}` })
+    }
+  }
+
+  async function deleteOpportunity(item: Opportunity) {
+    try {
+      if (cloudKey) await cloudRequest(cloudKey, 'DELETE', undefined, item.id)
+      setOpportunities(current => current.filter(entry => entry.id !== item.id))
+      setToast({ message: `Deleted “${item.title}”`, undo: () => { void restore([item]) } })
+    } catch (error) {
+      setToast({ message: `Couldn’t delete: ${(error as Error).message}` })
+    }
   }
 
   function removeSamples() {
     const samples = opportunities.filter(item => item.sample)
     setOpportunities(current => current.filter(item => !item.sample))
-    setToast({ message: `Removed ${samples.length} example${samples.length === 1 ? '' : 's'}`, undo: () => restore(samples) })
+    setToast({ message: `Removed ${samples.length} example${samples.length === 1 ? '' : 's'}`, undo: () => { void restore(samples) } })
   }
 
   function clearFilters() {
@@ -287,6 +373,8 @@ function App() {
             <span className="breadcrumb">Workspace <span aria-hidden="true">/</span> <strong>{pageName}</strong></span>
           </div>
           <div className="topbar-actions">
+            {cloudKey && <button className="text-button" type="button" onClick={() => { void refreshCloud() }}>Refresh</button>}
+            <button className="text-button" type="button" onClick={() => { void connectCloud() }}>{cloudKey ? 'Disconnect Neon' : 'Connect Neon'}</button>
             <label className="search-box">
               <Search size={16} aria-hidden="true" />
               <span className="sr-only">Search opportunities</span>
@@ -447,7 +535,7 @@ function App() {
               <li><span aria-hidden="true">02</span><strong>Move them forward</strong><p>Change status as you work, submit, and win.</p></li>
               <li><span aria-hidden="true">03</span><strong>Keep a copy</strong><p>Use the download button to export your entries as JSON.</p></li>
             </ol>
-            <p className="help-note">Your data stays in this browser. Starter examples are fictional.</p>
+            <p className="help-note">{cloudKey ? 'Your opportunities are saved in Neon.' : 'Your data stays in this browser until you connect Neon.'} Starter examples are fictional.</p>
             <button className="primary-button" type="button" data-autofocus onClick={() => { setShowHelp(false); openForm() }}>Add an opportunity <ArrowRight size={16} aria-hidden="true" /></button>
           </>}
         </Modal>
